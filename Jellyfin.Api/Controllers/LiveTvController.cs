@@ -1203,4 +1203,133 @@ public class LiveTvController : BaseJellyfinApiController
         var liveStream = new ProgressiveFileStream(liveStreamInfo.GetStream());
         return new FileStreamResult(liveStream, MimeTypes.GetMimeType("file." + container));
     }
+
+    /// <summary>
+    /// Gets a proxied HLS media playlist for an upstream segmented live stream (rung-2 passthrough).
+    /// </summary>
+    /// <param name="streamId">The live stream id.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <response code="200">Proxied playlist returned.</response>
+    /// <response code="404">Stream not found or not a segmented HLS media playlist.</response>
+    /// <returns>The rewritten HLS media playlist.</returns>
+    [HttpGet("LiveStreamFiles/{streamId}/hls-proxy.m3u8")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult> GetHlsProxyPlaylist(
+        [FromRoute, Required] string streamId,
+        CancellationToken cancellationToken)
+    {
+        var liveStreamInfo = _mediaSourceManager.GetLiveStreamInfo(streamId);
+        var mediaSource = liveStreamInfo?.MediaSource;
+        if (mediaSource is null
+            || !string.Equals(mediaSource.Container, "hls", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrEmpty(mediaSource.Path)
+            || !Uri.TryCreate(mediaSource.Path, UriKind.Absolute, out var upstreamUri)
+            || (upstreamUri.Scheme != Uri.UriSchemeHttp && upstreamUri.Scheme != Uri.UriSchemeHttps))
+        {
+            return NotFound();
+        }
+
+        string content;
+        Uri resolvedUri;
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
+            ApplyUpstreamHeaders(request, mediaSource.RequiredHttpHeaders);
+            using var response = await _httpClientFactory.CreateClient(NamedClient.Default)
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return NotFound();
+            }
+
+            // Resolve relative segment URIs against the final URL after any redirects.
+            resolvedUri = response.RequestMessage?.RequestUri ?? upstreamUri;
+            content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (HttpRequestException)
+        {
+            return NotFound();
+        }
+
+        if (HlsPlaylistProxyHelper.Classify(content) != HlsPlaylistProxyHelper.HlsPlaylistKind.Media)
+        {
+            return NotFound();
+        }
+
+        var apiKey = User.GetToken();
+        var rewritten = HlsPlaylistProxyHelper.RewriteMediaPlaylist(content, resolvedUri, "hls-proxy-segment", apiKey);
+        return Content(rewritten, "application/vnd.apple.mpegurl", Encoding.UTF8);
+    }
+
+    /// <summary>
+    /// Server-side fetches a single upstream HLS segment (or key/map) for a proxied live stream.
+    /// </summary>
+    /// <param name="streamId">The live stream id.</param>
+    /// <param name="u">The absolute upstream URL of the segment.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <response code="200">Segment returned.</response>
+    /// <response code="400">Invalid or disallowed segment URL.</response>
+    /// <response code="404">Stream not found.</response>
+    /// <returns>The proxied segment bytes.</returns>
+    [HttpGet("LiveStreamFiles/{streamId}/hls-proxy-segment")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesVideoFile]
+    public async Task<ActionResult> GetHlsProxySegment(
+        [FromRoute, Required] string streamId,
+        [FromQuery, Required] string u,
+        CancellationToken cancellationToken)
+    {
+        var liveStreamInfo = _mediaSourceManager.GetLiveStreamInfo(streamId);
+        var mediaSource = liveStreamInfo?.MediaSource;
+        if (mediaSource is null
+            || string.IsNullOrEmpty(mediaSource.Path)
+            || !Uri.TryCreate(mediaSource.Path, UriKind.Absolute, out var upstreamUri))
+        {
+            return NotFound();
+        }
+
+        // Anti-SSRF: only fetch http(s) URLs whose host matches the opened live stream's upstream host.
+        if (!Uri.TryCreate(u, UriKind.Absolute, out var targetUri)
+            || (targetUri.Scheme != Uri.UriSchemeHttp && targetUri.Scheme != Uri.UriSchemeHttps)
+            || !string.Equals(targetUri.Host, upstreamUri.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest();
+        }
+
+        var request = new HttpRequestMessage(HttpMethod.Get, targetUri);
+        ApplyUpstreamHeaders(request, mediaSource.RequiredHttpHeaders);
+        var response = await _httpClientFactory.CreateClient(NamedClient.Default)
+            .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The framework disposes the returned stream, but not the message/response.
+        HttpContext.Response.RegisterForDispose(response);
+        HttpContext.Response.RegisterForDispose(request);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return StatusCode((int)response.StatusCode);
+        }
+
+        var contentType = response.Content.Headers.ContentType?.ToString() ?? "video/mp2t";
+        var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        return File(stream, contentType);
+    }
+
+    private static void ApplyUpstreamHeaders(HttpRequestMessage request, IDictionary<string, string>? headers)
+    {
+        if (headers is null)
+        {
+            return;
+        }
+
+        foreach (var (key, value) in headers)
+        {
+            request.Headers.TryAddWithoutValidation(key, value);
+        }
+    }
 }

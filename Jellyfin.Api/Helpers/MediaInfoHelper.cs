@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Security.Claims;
 using System.Text.Json;
 using System.Threading;
@@ -44,6 +46,7 @@ public class MediaInfoHelper
     private readonly ILogger<MediaInfoHelper> _logger;
     private readonly INetworkManager _networkManager;
     private readonly IDeviceManager _deviceManager;
+    private readonly IHttpClientFactory _httpClientFactory;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MediaInfoHelper"/> class.
@@ -56,6 +59,7 @@ public class MediaInfoHelper
     /// <param name="logger">Instance of the <see cref="ILogger{MediaInfoHelper}"/> interface.</param>
     /// <param name="networkManager">Instance of the <see cref="INetworkManager"/> interface.</param>
     /// <param name="deviceManager">Instance of the <see cref="IDeviceManager"/> interface.</param>
+    /// <param name="httpClientFactory">Instance of the <see cref="IHttpClientFactory"/> interface.</param>
     public MediaInfoHelper(
         IUserManager userManager,
         ILibraryManager libraryManager,
@@ -64,7 +68,8 @@ public class MediaInfoHelper
         IServerConfigurationManager serverConfigurationManager,
         ILogger<MediaInfoHelper> logger,
         INetworkManager networkManager,
-        IDeviceManager deviceManager)
+        IDeviceManager deviceManager,
+        IHttpClientFactory httpClientFactory)
     {
         _userManager = userManager;
         _libraryManager = libraryManager;
@@ -74,6 +79,7 @@ public class MediaInfoHelper
         _logger = logger;
         _networkManager = networkManager;
         _deviceManager = deviceManager;
+        _httpClientFactory = httpClientFactory;
     }
 
     /// <summary>
@@ -441,6 +447,10 @@ public class MediaInfoHelper
                 true,
                 request.AlwaysBurnInSubtitleWhenTranscoding,
                 httpContext.GetNormalizedRemoteIP());
+
+            // Rung 2: if the upstream is a segmented HLS media playlist the client can direct-play,
+            // hand it a proxied playlist it drives itself instead of an ffmpeg remux.
+            await TryApplyHlsProxyPassthrough(result.MediaSource, profile, httpContext.User.GetToken()).ConfigureAwait(false);
         }
         else
         {
@@ -454,6 +464,110 @@ public class MediaInfoHelper
         NormalizeMediaSourceContainer(result.MediaSource, profile!, DlnaProfileType.Video);
 
         return result;
+    }
+
+    /// <summary>
+    /// Rung-2 passthrough gate. When the upstream live source is a segmented HLS <b>media</b> playlist
+    /// (not a master playlist, not a continuous stream) and the client can direct-play HLS for the
+    /// source's actual video and audio codecs, divert it to a proxied playlist the client drives itself.
+    /// Everything that does not qualify is left exactly as the existing remux/transcode path produced it.
+    /// </summary>
+    private async Task TryApplyHlsProxyPassthrough(MediaSourceInfo mediaSource, DeviceProfile profile, string? apiKey)
+    {
+        // Only live HLS sources are eligible. Container is ffprobe's label for the upstream input.
+        if (!string.Equals(mediaSource.Container, "hls", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrEmpty(mediaSource.Path)
+            || string.IsNullOrEmpty(mediaSource.LiveStreamId)
+            || !Uri.TryCreate(mediaSource.Path, UriKind.Absolute, out var upstreamUri)
+            || (upstreamUri.Scheme != Uri.UriSchemeHttp && upstreamUri.Scheme != Uri.UriSchemeHttps))
+        {
+            return;
+        }
+
+        var videoStream = mediaSource.VideoStream;
+        var audioStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == MediaStreamType.Audio);
+        if (videoStream is null || audioStream is null)
+        {
+            return;
+        }
+
+        // Gate B: read capability from the supplied DeviceProfile every time. Advertising the "hls"
+        // container is not enough on its own — the profile must direct-play HLS for the *actual* codecs.
+        if (!ClientDirectPlaysHls(profile, videoStream.Codec, audioStream.Codec))
+        {
+            return;
+        }
+
+        // Gate A: the upstream must be a genuine segmented media playlist. A master (variant) playlist or
+        // a continuous stream falls through to today's remux/transcode behavior (v1: remux on master).
+        string content;
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, upstreamUri);
+            if (mediaSource.RequiredHttpHeaders is not null)
+            {
+                foreach (var (key, value) in mediaSource.RequiredHttpHeaders)
+                {
+                    request.Headers.TryAddWithoutValidation(key, value);
+                }
+            }
+
+            using var response = await _httpClientFactory.CreateClient(NamedClient.Default)
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return;
+            }
+
+            content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "HLS passthrough probe failed for {Path}; falling back to remux", mediaSource.Path);
+            return;
+        }
+
+        if (HlsPlaylistProxyHelper.Classify(content) != HlsPlaylistProxyHelper.HlsPlaylistKind.Media)
+        {
+            return;
+        }
+
+        // Qualified for rung 2. Reuse the existing client contract for a client-driven playlist:
+        // direct-play/stream off, served via the HLS TranscodingUrl which now points at the proxy.
+        mediaSource.SupportsDirectPlay = false;
+        mediaSource.SupportsDirectStream = false;
+        mediaSource.SupportsTranscoding = true;
+
+        var url = $"/LiveTv/LiveStreamFiles/{Uri.EscapeDataString(mediaSource.LiveStreamId)}/hls-proxy.m3u8";
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            url += "?ApiKey=" + Uri.EscapeDataString(apiKey);
+        }
+
+        mediaSource.TranscodingUrl = url;
+        mediaSource.TranscodingSubProtocol = MediaStreamProtocol.hls;
+        mediaSource.TranscodingContainer = "ts";
+
+        _logger.LogInformation(
+            "Live HLS passthrough (rung 2 proxied) enabled for {Path} ({VideoCodec}/{AudioCodec})",
+            mediaSource.Path,
+            videoStream.Codec,
+            audioStream.Codec);
+    }
+
+    private static bool ClientDirectPlaysHls(DeviceProfile profile, string? videoCodec, string? audioCodec)
+    {
+        if (profile.DirectPlayProfiles is null)
+        {
+            return false;
+        }
+
+        return profile.DirectPlayProfiles.Any(p =>
+            p.Type == DlnaProfileType.Video
+            && p.SupportsContainer("hls")
+            && p.SupportsVideoCodec(videoCodec)
+            && p.SupportsAudioCodec(audioCodec));
     }
 
     /// <summary>
